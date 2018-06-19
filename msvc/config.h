@@ -6,7 +6,7 @@
 #endif
 
 /* Visual Studio 2015 and later defines timespec */
-#if defined(_MSC_VER) && (_MSC_VER >= 1900)
+#if (_MSC_VER >= 1900)
 #define _TIMESPEC_DEFINED 1
 #endif
 
