@@ -30,10 +30,10 @@
 
 #include "libusbi.h"
 #include "windows_common.h"
-#include "windows_nt_common.h"
+
+#define EPOCH_TIME	UINT64_C(116444736000000000)	// 1970.01.01 00:00:000 in MS Filetime
 
 // Public
-BOOL (WINAPI *pCancelIoEx)(HANDLE, LPOVERLAPPED);
 enum windows_version windows_version = WINDOWS_UNDEFINED;
 
  // Global variables for init/exit
@@ -44,33 +44,6 @@ static bool usbdk_available = false;
 static uint64_t hires_ticks_to_ps;
 static uint64_t hires_frequency;
 
-#define TIMER_REQUEST_RETRY_MS	100
-#define WM_TIMER_REQUEST	(WM_USER + 1)
-#define WM_TIMER_EXIT		(WM_USER + 2)
-
-// used for monotonic clock_gettime()
-struct timer_request {
-	struct timespec *tp;
-	HANDLE event;
-};
-
-// Timer thread
-static HANDLE timer_thread = NULL;
-static DWORD timer_thread_id = 0;
-
-/* Kernel32 dependencies */
-DLL_DECLARE_HANDLE(Kernel32);
-/* This call is only available from XP SP2 */
-DLL_DECLARE_FUNC_PREFIXED(WINAPI, BOOL, p, IsWow64Process, (HANDLE, PBOOL));
-
-/* User32 dependencies */
-DLL_DECLARE_HANDLE(User32);
-DLL_DECLARE_FUNC_PREFIXED(WINAPI, BOOL, p, GetMessageA, (LPMSG, HWND, UINT, UINT));
-DLL_DECLARE_FUNC_PREFIXED(WINAPI, BOOL, p, PeekMessageA, (LPMSG, HWND, UINT, UINT, UINT));
-DLL_DECLARE_FUNC_PREFIXED(WINAPI, BOOL, p, PostThreadMessageA, (DWORD, UINT, WPARAM, LPARAM));
-
-static unsigned __stdcall windows_clock_gettime_threaded(void *param);
-
 /*
 * Converts a windows error to human readable string
 * uses retval as errorcode, or, if 0, use GetLastError()
@@ -78,7 +51,7 @@ static unsigned __stdcall windows_clock_gettime_threaded(void *param);
 #if defined(ENABLE_LOGGING)
 const char *windows_error_str(DWORD error_code)
 {
-	static char err_string[ERR_BUFFER_SIZE];
+	static char err_string[256];
 
 	DWORD size;
 	int len;
@@ -86,7 +59,7 @@ const char *windows_error_str(DWORD error_code)
 	if (error_code == 0)
 		error_code = GetLastError();
 
-	len = sprintf(err_string, "[%u] ", (unsigned int)error_code);
+	len = sprintf(err_string, "[%lu] ", error_code);
 
 	// Translate codes returned by SetupAPI. The ones we are dealing with are either
 	// in 0x0000xxxx or 0xE000xxxx and can be distinguished from standard error codes.
@@ -104,15 +77,15 @@ const char *windows_error_str(DWORD error_code)
 
 	size = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM|FORMAT_MESSAGE_IGNORE_INSERTS,
 			NULL, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-			&err_string[len], ERR_BUFFER_SIZE - len, NULL);
+			&err_string[len], sizeof(err_string) - len, NULL);
 	if (size == 0) {
 		DWORD format_error = GetLastError();
 		if (format_error)
-			snprintf(err_string, ERR_BUFFER_SIZE,
-				"Windows error code %u (FormatMessage error code %u)",
-				(unsigned int)error_code, (unsigned int)format_error);
+			snprintf(err_string, sizeof(err_string),
+				"Windows error code %lu (FormatMessage error code %lu)",
+				error_code, format_error);
 		else
-			snprintf(err_string, ERR_BUFFER_SIZE, "Unknown error code %u", (unsigned int)error_code);
+			snprintf(err_string, sizeof(err_string), "Unknown error code %lu", error_code);
 	} else {
 		// Remove CRLF from end of message, if present
 		size_t pos = len + size - 2;
@@ -284,106 +257,19 @@ void windows_force_sync_completion(OVERLAPPED *overlapped, ULONG size)
 	SetEvent(overlapped->hEvent);
 }
 
-static BOOL windows_init_dlls(void)
+static void windows_init_clock(void)
 {
-	DLL_GET_HANDLE(Kernel32);
-	DLL_LOAD_FUNC_PREFIXED(Kernel32, p, IsWow64Process, FALSE);
-	pCancelIoEx = (BOOL (WINAPI *)(HANDLE, LPOVERLAPPED))
-		GetProcAddress(DLL_HANDLE_NAME(Kernel32), "CancelIoEx");
-	usbi_dbg("Will use CancelIo%s for I/O cancellation", pCancelIoEx ? "Ex" : "");
-
-	DLL_GET_HANDLE(User32);
-	DLL_LOAD_FUNC_PREFIXED(User32, p, GetMessageA, TRUE);
-	DLL_LOAD_FUNC_PREFIXED(User32, p, PeekMessageA, TRUE);
-	DLL_LOAD_FUNC_PREFIXED(User32, p, PostThreadMessageA, TRUE);
-
-	return TRUE;
-}
-
-static void windows_exit_dlls(void)
-{
-	DLL_FREE_HANDLE(Kernel32);
-	DLL_FREE_HANDLE(User32);
-}
-
-static bool windows_init_clock(struct libusb_context *ctx)
-{
-	DWORD_PTR affinity, dummy;
-	HANDLE event;
 	LARGE_INTEGER li_frequency;
-	int i;
 
-	if (QueryPerformanceFrequency(&li_frequency)) {
-		// The hires frequency can go as high as 4 GHz, so we'll use a conversion
-		// to picoseconds to compute the tv_nsecs part in clock_gettime
-		hires_frequency = li_frequency.QuadPart;
-		hires_ticks_to_ps = UINT64_C(1000000000000) / hires_frequency;
-		usbi_dbg("hires timer available (Frequency: %"PRIu64" Hz)", hires_frequency);
+	// Microsoft says that the QueryPerformanceFrequency() and
+	// QueryPerformanceCounter() functions always succeed on XP and later
+	QueryPerformanceFrequency(&li_frequency);
 
-		// Because QueryPerformanceCounter might report different values when
-		// running on different cores, we create a separate thread for the timer
-		// calls, which we glue to the first available core always to prevent timing discrepancies.
-		if (!GetProcessAffinityMask(GetCurrentProcess(), &affinity, &dummy) || (affinity == 0)) {
-			usbi_err(ctx, "could not get process affinity: %s", windows_error_str(0));
-			return false;
-		}
-
-		// The process affinity mask is a bitmask where each set bit represents a core on
-		// which this process is allowed to run, so we find the first set bit
-		for (i = 0; !(affinity & (DWORD_PTR)(1 << i)); i++);
-		affinity = (DWORD_PTR)(1 << i);
-
-		usbi_dbg("timer thread will run on core #%d", i);
-
-		event = CreateEvent(NULL, FALSE, FALSE, NULL);
-		if (event == NULL) {
-			usbi_err(ctx, "could not create event: %s", windows_error_str(0));
-			return false;
-		}
-
-		timer_thread = (HANDLE)_beginthreadex(NULL, 0, windows_clock_gettime_threaded, (void *)event,
-				0, (unsigned int *)&timer_thread_id);
-		if (timer_thread == NULL) {
-			usbi_err(ctx, "unable to create timer thread - aborting");
-			CloseHandle(event);
-			return false;
-		}
-
-		if (!SetThreadAffinityMask(timer_thread, affinity))
-			usbi_warn(ctx, "unable to set timer thread affinity, timer discrepancies may arise");
-
-		// Wait for timer thread to init before continuing.
-		if (WaitForSingleObject(event, INFINITE) != WAIT_OBJECT_0) {
-			usbi_err(ctx, "failed to wait for timer thread to become ready - aborting");
-			CloseHandle(event);
-			return false;
-		}
-
-		CloseHandle(event);
-	} else {
-		usbi_dbg("no hires timer available on this platform");
-		hires_frequency = 0;
-		hires_ticks_to_ps = UINT64_C(0);
-	}
-
-	return true;
-}
-
-static void windows_destroy_clock(void)
-{
-	if (timer_thread) {
-		// actually the signal to quit the thread.
-		if (!pPostThreadMessageA(timer_thread_id, WM_TIMER_EXIT, 0, 0)
-				|| (WaitForSingleObject(timer_thread, INFINITE) != WAIT_OBJECT_0)) {
-			usbi_dbg("could not wait for timer thread to quit");
-			TerminateThread(timer_thread, 1);
-			// shouldn't happen, but we're destroying
-			// all objects it might have held anyway.
-		}
-		CloseHandle(timer_thread);
-		timer_thread = NULL;
-		timer_thread_id = 0;
-	}
+	// The hires frequency can go as high as 4 GHz, so we'll use a conversion
+	// to picoseconds to compute the tv_nsecs part in clock_gettime
+	hires_frequency = li_frequency.QuadPart;
+	hires_ticks_to_ps = UINT64_C(1000000000000) / hires_frequency;
+	usbi_dbg("hires timer frequency: %"PRIu64" Hz", hires_frequency);
 }
 
 /* Windows version detection */
@@ -393,8 +279,7 @@ static BOOL is_x64(void)
 
 	// Detect if we're running a 32 or 64 bit system
 	if (sizeof(uintptr_t) < 8) {
-		if (pIsWow64Process != NULL)
-			pIsWow64Process(GetCurrentProcess(), &ret);
+		IsWow64Process(GetCurrentProcess(), &ret);
 	} else {
 		ret = TRUE;
 	}
@@ -470,7 +355,8 @@ static void get_windows_version(void)
 	case 0x61: windows_version = WINDOWS_7;	    w = (ws ? "7" : "2008_R2");	  break;
 	case 0x62: windows_version = WINDOWS_8;	    w = (ws ? "8" : "2012");	  break;
 	case 0x63: windows_version = WINDOWS_8_1;   w = (ws ? "8.1" : "2012_R2"); break;
-	case 0x64: windows_version = WINDOWS_10;    w = (ws ? "10" : "2016");	  break;
+	case 0x64: // Early Windows 10 Insider Previews and Windows Server 2017 Technical Preview 1 used version 6.4
+	case 0xA0: windows_version = WINDOWS_10;    w = (ws ? "10" : "2016");	  break;
 	default:
 		if (version < 0x50) {
 			return;
@@ -490,56 +376,12 @@ static void get_windows_version(void)
 		usbi_dbg("Windows %s %s", w, arch);
 }
 
-/*
-* Monotonic and real time functions
-*/
-static unsigned __stdcall windows_clock_gettime_threaded(void *param)
-{
-	struct timer_request *request;
-	LARGE_INTEGER hires_counter;
-	MSG msg;
-
-	// The following call will create this thread's message queue
-	// See https://msdn.microsoft.com/en-us/library/windows/desktop/ms644946.aspx
-	pPeekMessageA(&msg, NULL, WM_USER, WM_USER, PM_NOREMOVE);
-
-	// Signal windows_init_clock() that we're ready to service requests
-	if (!SetEvent((HANDLE)param))
-		usbi_dbg("SetEvent failed for timer init event: %s", windows_error_str(0));
-	param = NULL;
-
-	// Main loop - wait for requests
-	while (1) {
-		if (pGetMessageA(&msg, NULL, WM_TIMER_REQUEST, WM_TIMER_EXIT) == -1) {
-			usbi_err(NULL, "GetMessage failed for timer thread: %s", windows_error_str(0));
-			return 1;
-		}
-
-		switch (msg.message) {
-		case WM_TIMER_REQUEST:
-			// Requests to this thread are for hires always
-			// Microsoft says that this function always succeeds on XP and later
-			// See https://msdn.microsoft.com/en-us/library/windows/desktop/ms644904.aspx
-			request = (struct timer_request *)msg.lParam;
-			QueryPerformanceCounter(&hires_counter);
-			request->tp->tv_sec = (long)(hires_counter.QuadPart / hires_frequency);
-			request->tp->tv_nsec = (long)(((hires_counter.QuadPart % hires_frequency) / 1000) * hires_ticks_to_ps);
-			if (!SetEvent(request->event))
-				usbi_err(NULL, "SetEvent failed for timer request: %s", windows_error_str(0));
-			break;
-		case WM_TIMER_EXIT:
-			usbi_dbg("timer thread quitting");
-			return 0;
-		}
-	}
-}
-
 static void windows_transfer_callback(const struct windows_backend *backend,
 	struct usbi_transfer *itransfer, DWORD io_result, DWORD io_size)
 {
 	int status, istatus;
 
-	usbi_dbg("handling I/O completion with errcode %u, size %u", (unsigned int)io_result, (unsigned int)io_size);
+	usbi_dbg("handling I/O completion with errcode %lu, size %lu", io_result, io_size);
 
 	switch (io_result) {
 	case NO_ERROR:
@@ -562,11 +404,12 @@ static void windows_transfer_callback(const struct windows_backend *backend,
 		status = LIBUSB_TRANSFER_CANCELLED;
 		break;
 	case ERROR_FILE_NOT_FOUND:
+	case ERROR_DEVICE_NOT_CONNECTED:
 		usbi_dbg("detected device removed");
 		status = LIBUSB_TRANSFER_NO_DEVICE;
 		break;
 	default:
-		usbi_err(ITRANSFER_CTX(itransfer), "detected I/O error %u: %s", (unsigned int)io_result, windows_error_str(io_result));
+		usbi_err(ITRANSFER_CTX(itransfer), "detected I/O error %lu: %s", io_result, windows_error_str(io_result));
 		status = LIBUSB_TRANSFER_ERROR;
 		break;
 	}
@@ -623,12 +466,6 @@ static int windows_init(struct libusb_context *ctx)
 	// NB: concurrent usage supposes that init calls are equally balanced with
 	// exit calls. If init is called more than exit, we will not exit properly
 	if (++init_count == 1) { // First init?
-		// Load DLL imports
-		if (!windows_init_dlls()) {
-			usbi_err(ctx, "could not resolve DLL functions");
-			goto init_exit;
-		}
-
 		get_windows_version();
 
 		if (windows_version == WINDOWS_UNDEFINED) {
@@ -637,8 +474,7 @@ static int windows_init(struct libusb_context *ctx)
 			goto init_exit;
 		}
 
-		if (!windows_init_clock(ctx))
-			goto init_exit;
+		windows_init_clock();
 
 		if (!htab_create(ctx))
 			goto init_exit;
@@ -669,8 +505,6 @@ init_exit: // Holds semaphore here
 		if (winusb_backend_init)
 			winusb_backend.exit(ctx);
 		htab_destroy();
-		windows_destroy_clock();
-		windows_exit_dlls();
 		--init_count;
 	}
 
@@ -685,7 +519,7 @@ static void windows_exit(struct libusb_context *ctx)
 	char sem_name[11 + 8 + 1]; // strlen("libusb_init") + (32-bit hex PID) + '\0'
 	UNUSED(ctx);
 
-	sprintf(sem_name, "libusb_init%08X", (unsigned int)(GetCurrentProcessId() & 0xFFFFFFFF));
+	sprintf(sem_name, "libusb_init%08lX", (GetCurrentProcessId() & 0xFFFFFFFFUL));
 	semaphore = CreateSemaphoreA(NULL, 1, 1, sem_name);
 	if (semaphore == NULL)
 		return;
@@ -705,8 +539,6 @@ static void windows_exit(struct libusb_context *ctx)
 		}
 		winusb_backend.exit(ctx);
 		htab_destroy();
-		windows_destroy_clock();
-		windows_exit_dlls();
 	}
 
 	ReleaseSemaphore(semaphore, 1, NULL); // increase count back to 1
@@ -846,18 +678,12 @@ static int windows_cancel_transfer(struct usbi_transfer *itransfer)
 	return priv->backend->cancel_transfer(itransfer);
 }
 
-static void windows_clear_transfer_priv(struct usbi_transfer *itransfer)
-{
-	struct windows_context_priv *priv = _context_priv(ITRANSFER_CTX(itransfer));
-	priv->backend->clear_transfer_priv(itransfer);
-}
-
-static int windows_handle_events(struct libusb_context *ctx, struct pollfd *fds, POLL_NFDS_TYPE nfds, int num_ready)
+static int windows_handle_events(struct libusb_context *ctx, struct pollfd *fds, usbi_nfds_t nfds, int num_ready)
 {
 	struct windows_context_priv *priv = _context_priv(ctx);
 	struct usbi_transfer *itransfer;
 	DWORD io_size, io_result;
-	POLL_NFDS_TYPE i;
+	usbi_nfds_t i;
 	bool found;
 	int transfer_fd;
 	int r = LIBUSB_SUCCESS;
@@ -908,45 +734,25 @@ static int windows_handle_events(struct libusb_context *ctx, struct pollfd *fds,
 
 static int windows_clock_gettime(int clk_id, struct timespec *tp)
 {
-	struct timer_request request;
+	LARGE_INTEGER hires_counter;
 #if !defined(_MSC_VER) || (_MSC_VER < 1900)
 	FILETIME filetime;
 	ULARGE_INTEGER rtime;
 #endif
-	DWORD r;
 
 	switch (clk_id) {
 	case USBI_CLOCK_MONOTONIC:
-		if (timer_thread) {
-			request.tp = tp;
-			request.event = CreateEvent(NULL, FALSE, FALSE, NULL);
-			if (request.event == NULL)
-				return LIBUSB_ERROR_NO_MEM;
-
-			if (!pPostThreadMessageA(timer_thread_id, WM_TIMER_REQUEST, 0, (LPARAM)&request)) {
-				usbi_err(NULL, "PostThreadMessage failed for timer thread: %s", windows_error_str(0));
-				CloseHandle(request.event);
-				return LIBUSB_ERROR_OTHER;
-			}
-
-			do {
-				r = WaitForSingleObject(request.event, TIMER_REQUEST_RETRY_MS);
-				if (r == WAIT_TIMEOUT)
-					usbi_dbg("could not obtain a timer value within reasonable timeframe - too much load?");
-				else if (r == WAIT_FAILED)
-					usbi_err(NULL, "WaitForSingleObject failed: %s", windows_error_str(0));
-			} while (r == WAIT_TIMEOUT);
-			CloseHandle(request.event);
-
-			if (r == WAIT_OBJECT_0)
-				return LIBUSB_SUCCESS;
-			else
-				return LIBUSB_ERROR_OTHER;
+		if (hires_frequency) {
+			QueryPerformanceCounter(&hires_counter);
+			tp->tv_sec = (long)(hires_counter.QuadPart / hires_frequency);
+			tp->tv_nsec = (long)(((hires_counter.QuadPart % hires_frequency) * hires_ticks_to_ps) / UINT64_C(1000));
+			return LIBUSB_SUCCESS;
 		}
 		// Fall through and return real-time if monotonic was not detected @ timer init
 	case USBI_CLOCK_REALTIME:
 #if defined(_MSC_VER) && (_MSC_VER >= 1900)
-		timespec_get(tp, TIME_UTC);
+		if (!timespec_get(tp, TIME_UTC))
+			return LIBUSB_ERROR_OTHER;
 #else
 		// We follow http://msdn.microsoft.com/en-us/library/ms724928%28VS.85%29.aspx
 		// with a predef epoch time to have an epoch that starts at 1970.01.01 00:00
@@ -974,6 +780,7 @@ const struct usbi_os_backend usbi_backend = {
 	windows_set_option,
 	windows_get_device_list,
 	NULL,	/* hotplug_poll */
+	NULL,	/* wrap_sys_device */
 	windows_open,
 	windows_close,
 	windows_get_device_descriptor,
@@ -997,7 +804,7 @@ const struct usbi_os_backend usbi_backend = {
 	windows_destroy_device,
 	windows_submit_transfer,
 	windows_cancel_transfer,
-	windows_clear_transfer_priv,
+	NULL,	/* clear_transfer_priv */
 	windows_handle_events,
 	NULL,	/* handle_transfer_completion */
 	windows_clock_gettime,
