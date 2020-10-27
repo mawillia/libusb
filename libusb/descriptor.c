@@ -19,14 +19,9 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include <config.h>
-
-#include <errno.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-
 #include "libusbi.h"
+
+#include <string.h>
 
 #define DESC_HEADER_LENGTH		2
 #define DEVICE_DESC_LENGTH		18
@@ -62,7 +57,7 @@ int usbi_parse_descriptor(const unsigned char *source, const char *descriptor,
 				if (host_endian) {
 					memcpy(dp, sp, 2);
 				} else {
-					w = (sp[1] << 8) | sp[0];
+					w = (uint16_t)((sp[1] << 8) | sp[0]);
 					*((uint16_t *)dp) = w;
 				}
 				sp += 2;
@@ -74,8 +69,8 @@ int usbi_parse_descriptor(const unsigned char *source, const char *descriptor,
 				if (host_endian) {
 					memcpy(dp, sp, 4);
 				} else {
-					d = (sp[3] << 24) | (sp[2] << 16) |
-						(sp[1] << 8) | sp[0];
+					d = (uint32_t)((sp[3] << 24) | (sp[2] << 16) |
+								   (sp[1] << 8) | sp[0]);
 					*((uint32_t *)dp) = d;
 				}
 				sp += 4;
@@ -168,13 +163,13 @@ static int parse_endpoint(struct libusb_context *ctx,
 	/* Copy any unknown descriptors into a storage area for drivers */
 	/*  to later parse */
 	len = (int)(buffer - begin);
-	if (!len) {
+	if (len <= 0) {
 		endpoint->extra = NULL;
 		endpoint->extra_length = 0;
 		return parsed;
 	}
 
-	extra = malloc(len);
+	extra = malloc((size_t)len);
 	endpoint->extra = extra;
 	if (!extra) {
 		endpoint->extra_length = 0;
@@ -230,7 +225,7 @@ static int parse_interface(libusb_context *ctx,
 			(struct libusb_interface_descriptor *) usb_interface->altsetting;
 		altsetting = usbi_reallocf(altsetting,
 			sizeof(struct libusb_interface_descriptor) *
-			(usb_interface->num_altsetting + 1));
+			((size_t)usb_interface->num_altsetting + 1));
 		if (!altsetting) {
 			r = LIBUSB_ERROR_NO_MEM;
 			goto err;
@@ -307,8 +302,8 @@ static int parse_interface(libusb_context *ctx,
 		/* Copy any unknown descriptors into a storage area for */
 		/*  drivers to later parse */
 		len = (int)(buffer - begin);
-		if (len) {
-			ifp->extra = malloc(len);
+		if (len > 0) {
+			ifp->extra = malloc((size_t)len);
 			if (!ifp->extra) {
 				r = LIBUSB_ERROR_NO_MEM;
 				goto err;
@@ -475,10 +470,10 @@ static int parse_configuration(struct libusb_context *ctx,
 		/* Copy any unknown descriptors into a storage area for */
 		/*  drivers to later parse */
 		len = (int)(buffer - begin);
-		if (len) {
+		if (len > 0) {
 			/* FIXME: We should realloc and append here */
 			if (!config->extra_length) {
-				config->extra = malloc(len);
+				config->extra = malloc((size_t)len);
 				if (!config->extra) {
 					r = LIBUSB_ERROR_NO_MEM;
 					goto err;
@@ -514,7 +509,7 @@ static int raw_desc_to_config(struct libusb_context *ctx,
 {
 	struct libusb_config_descriptor *_config = malloc(sizeof(*_config));
 	int r;
-	
+
 	if (!_config)
 		return LIBUSB_ERROR_NO_MEM;
 
@@ -526,7 +521,7 @@ static int raw_desc_to_config(struct libusb_context *ctx,
 	} else if (r > 0) {
 		usbi_warn(ctx, "still %d bytes of descriptor data left", r);
 	}
-	
+
 	*config = _config;
 	return LIBUSB_SUCCESS;
 }
@@ -565,7 +560,7 @@ int usbi_device_cache_descriptor(libusb_device *dev)
 int API_EXPORTED libusb_get_device_descriptor(libusb_device *dev,
 	struct libusb_device_descriptor *desc)
 {
-	usbi_dbg("");
+	usbi_dbg(" ");
 	memcpy((unsigned char *) desc, (unsigned char *) &dev->device_descriptor,
 	       sizeof (dev->device_descriptor));
 	return 0;
@@ -1082,7 +1077,8 @@ int API_EXPORTED libusb_get_ss_usb_device_capability_descriptor(
  * It is safe to call this function with a NULL ss_usb_device_cap
  * parameter, in which case the function simply returns.
  *
- * \param ss_usb_device_cap the USB 2.0 Extension descriptor to free
+ * \param ss_usb_device_cap the SuperSpeed USB Device Capability descriptor
+ * to free
  */
 void API_EXPORTED libusb_free_ss_usb_device_capability_descriptor(
 	struct libusb_ss_usb_device_capability_descriptor *ss_usb_device_cap)
@@ -1139,7 +1135,7 @@ int API_EXPORTED libusb_get_container_id_descriptor(struct libusb_context *ctx,
  * It is safe to call this function with a NULL container_id parameter,
  * in which case the function simply returns.
  *
- * \param container_id the USB 2.0 Extension descriptor to free
+ * \param container_id the Container ID descriptor to free
  */
 void API_EXPORTED libusb_free_container_id_descriptor(
 	struct libusb_container_id_descriptor *container_id)
@@ -1185,7 +1181,7 @@ int API_EXPORTED libusb_get_string_descriptor_ascii(libusb_device_handle *dev_ha
 	if (r < 4)
 		return LIBUSB_ERROR_IO;
 
-	langid = tbuf[2] | (tbuf[3] << 8);
+	langid = (uint16_t)(tbuf[2] | (tbuf[3] << 8));
 
 	r = libusb_get_string_descriptor(dev_handle, desc_index, langid, tbuf,
 		sizeof(tbuf));

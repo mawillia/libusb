@@ -73,7 +73,6 @@ static void obsd_destroy_device(struct libusb_device *);
 
 static int obsd_submit_transfer(struct usbi_transfer *);
 static int obsd_cancel_transfer(struct usbi_transfer *);
-static void obsd_clear_transfer_priv(struct usbi_transfer *);
 static int obsd_handle_transfer_completion(struct usbi_transfer *);
 static int obsd_clock_gettime(int, struct timespec *);
 
@@ -90,55 +89,35 @@ static int _bus_open(int);
 
 
 const struct usbi_os_backend usbi_backend = {
-	"Synchronous OpenBSD backend",
-	0,
-	NULL,				/* init() */
-	NULL,				/* exit() */
-	NULL,				/* set_option() */
-	obsd_get_device_list,
-	NULL,				/* hotplug_poll */
-	obsd_open,
-	obsd_close,
+	.name = "Synchronous OpenBSD backend",
+	.get_device_list = obsd_get_device_list,
+	.open = obsd_open,
+	.close = obsd_close,
 
-	obsd_get_device_descriptor,
-	obsd_get_active_config_descriptor,
-	obsd_get_config_descriptor,
-	NULL,				/* get_config_descriptor_by_value() */
+	.get_device_descriptor = obsd_get_device_descriptor,
+	.get_active_config_descriptor = obsd_get_active_config_descriptor,
+	.get_config_descriptor = obsd_get_config_descriptor,
 
-	obsd_get_configuration,
-	obsd_set_configuration,
+	.get_configuration = obsd_get_configuration,
+	.set_configuration = obsd_set_configuration,
 
-	obsd_claim_interface,
-	obsd_release_interface,
+	.claim_interface = obsd_claim_interface,
+	.release_interface = obsd_release_interface,
 
-	obsd_set_interface_altsetting,
-	obsd_clear_halt,
-	obsd_reset_device,
+	.set_interface_altsetting = obsd_set_interface_altsetting,
+	.clear_halt = obsd_clear_halt,
+	.reset_device = obsd_reset_device,
+	.destroy_device = obsd_destroy_device,
 
-	NULL,				/* alloc_streams */
-	NULL,				/* free_streams */
+	.submit_transfer = obsd_submit_transfer,
+	.cancel_transfer = obsd_cancel_transfer,
 
-	NULL,				/* dev_mem_alloc() */
-	NULL,				/* dev_mem_free() */
+	.handle_transfer_completion = obsd_handle_transfer_completion,
 
-	NULL,				/* kernel_driver_active() */
-	NULL,				/* detach_kernel_driver() */
-	NULL,				/* attach_kernel_driver() */
+	.clock_gettime = obsd_clock_gettime,
 
-	obsd_destroy_device,
-
-	obsd_submit_transfer,
-	obsd_cancel_transfer,
-	obsd_clear_transfer_priv,
-
-	NULL,				/* handle_events() */
-	obsd_handle_transfer_completion,
-
-	obsd_clock_gettime,
-	0,				/* context_priv_size */
-	sizeof(struct device_priv),
-	sizeof(struct handle_priv),
-	0,				/* transfer_priv_size */
+	.device_priv_size = sizeof(struct device_priv),
+	.device_handle_priv_size = sizeof(struct handle_priv),
 };
 
 #define DEVPATH	"/dev/"
@@ -159,7 +138,7 @@ obsd_get_device_list(struct libusb_context * ctx,
 	char *udevname;
 	int fd, addr, i, j;
 
-	usbi_dbg("");
+	usbi_dbg(" ");
 
 	for (i = 0; i < 8; i++) {
 		snprintf(busnode, sizeof(busnode), USBDEV "%d", i);
@@ -287,7 +266,7 @@ obsd_get_device_descriptor(struct libusb_device *dev, unsigned char *buf,
 {
 	struct device_priv *dpriv = (struct device_priv *)dev->os_priv;
 
-	usbi_dbg("");
+	usbi_dbg(" ");
 
 	memcpy(buf, &dpriv->ddesc, DEVICE_DESC_LENGTH);
 
@@ -305,7 +284,7 @@ obsd_get_active_config_descriptor(struct libusb_device *dev,
 
 	len = MIN(len, UGETW(ucd->wTotalLength));
 
-	usbi_dbg("len %d", len);
+	usbi_dbg("len %zu", len);
 
 	memcpy(buf, dpriv->cdesc, len);
 
@@ -330,7 +309,7 @@ obsd_get_config_descriptor(struct libusb_device *dev, uint8_t idx,
 	udf.udf_size = len;
 	udf.udf_data = buf;
 
-	usbi_dbg("index %d, len %d", udf.udf_config_index, len);
+	usbi_dbg("index %d, len %zu", udf.udf_config_index, len);
 
 	if (ioctl(fd, USB_DEVICE_GET_FDESC, &udf) < 0) {
 		err = errno;
@@ -430,7 +409,7 @@ obsd_clear_halt(struct libusb_device_handle *handle, unsigned char endpoint)
 	if ((fd = _bus_open(handle->dev->bus_number)) < 0)
 		return _errno_to_libusb(errno);
 
-	usbi_dbg("");
+	usbi_dbg(" ");
 
 	req.ucr_addr = handle->dev->device_address;
 	req.ucr_request.bmRequestType = UT_WRITE_ENDPOINT;
@@ -452,7 +431,7 @@ obsd_clear_halt(struct libusb_device_handle *handle, unsigned char endpoint)
 int
 obsd_reset_device(struct libusb_device_handle *handle)
 {
-	usbi_dbg("");
+	usbi_dbg(" ");
 
 	return (LIBUSB_ERROR_NOT_SUPPORTED);
 }
@@ -462,7 +441,7 @@ obsd_destroy_device(struct libusb_device *dev)
 {
 	struct device_priv *dpriv = (struct device_priv *)dev->os_priv;
 
-	usbi_dbg("");
+	usbi_dbg(" ");
 
 	free(dpriv->cdesc);
 	free(dpriv->devname);
@@ -475,7 +454,7 @@ obsd_submit_transfer(struct usbi_transfer *itransfer)
 	struct handle_priv *hpriv;
 	int err = 0;
 
-	usbi_dbg("");
+	usbi_dbg(" ");
 
 	transfer = USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer);
 	hpriv = (struct handle_priv *)transfer->dev_handle->os_priv;
@@ -517,17 +496,9 @@ obsd_submit_transfer(struct usbi_transfer *itransfer)
 int
 obsd_cancel_transfer(struct usbi_transfer *itransfer)
 {
-	usbi_dbg("");
+	usbi_dbg(" ");
 
 	return (LIBUSB_ERROR_NOT_SUPPORTED);
-}
-
-void
-obsd_clear_transfer_priv(struct usbi_transfer *itransfer)
-{
-	usbi_dbg("");
-
-	/* Nothing to do */
 }
 
 int
@@ -539,8 +510,6 @@ obsd_handle_transfer_completion(struct usbi_transfer *itransfer)
 int
 obsd_clock_gettime(int clkid, struct timespec *tp)
 {
-	usbi_dbg("clock %d", clkid);
-
 	if (clkid == USBI_CLOCK_REALTIME)
 		return clock_gettime(CLOCK_REALTIME, tp);
 
